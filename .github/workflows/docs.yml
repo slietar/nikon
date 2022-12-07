@@ -1,0 +1,31 @@
+on: push
+# on:
+#   push:
+#     tags:
+#       - '*'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - run: pip install .
+      - run: pip install pdoc3
+      - run: pdoc3 --html --output-dir docs nikon
+      - uses: actions/upload-pages-artifact@main
+        with:
+          path: docs
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v1
