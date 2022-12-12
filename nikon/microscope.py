@@ -1,8 +1,9 @@
-import asyncio
 from dataclasses import dataclass
+from typing import Optional, cast
+import asyncio
 import random
 import struct
-from typing import Optional, cast
+import time
 
 import usb.backend
 import usb.core
@@ -55,6 +56,10 @@ class StatusEvent:
   zoom: int
   """ The internal zoom level, `1` for 1X, `2` for 1.5X and `0` for an indeterminate value, which is reported when the user is changing the zoom from one level to the other. """
 
+  @property
+  def point(self):
+    return (self.x, self.y, self.z)
+
 @dataclass(kw_only=True)
 class ObjectiveInfo:
   magnification: int
@@ -73,13 +78,13 @@ class ObjectiveInfo:
   """ Whether the objective supports PFS. """
 
   refractive_index: str
-  """ The refractive index, one of `"Dry"`, `"WI"`, `"MImm"`, `"Oil"` or `"Sil"`."""
+  """ The refractive index, one of `"Dry"`, `"WI"`, `"MImm"`, `"Oil"` or `"Sil"`. """
 
   series: str
   """ The series identifier, for example `"Plan Fluor"`. """
 
   working_distance: int
-  """ The working distance [0.01 mm], for example `210` for 2.10 mm."""
+  """ The working distance [0.01 mm], for example `210` for 2.10 mm. """
 
 
 class MicroscopeDevice:
@@ -108,6 +113,7 @@ class MicroscopeDevice:
 
   async def _call(self, call_type: int, payload: bytes, /):
     return await self._request(b"\x01\x00\x21\xff\x00\x00" + bytes([call_type]) + payload.rjust(4, b"\x00"))
+
 
   # Version numbers
 
@@ -246,6 +252,25 @@ class MicroscopeDevice:
       z=unpacked[4],
       zoom=(unpacked[9] - 0x40)
     )
+
+  async def get_status(self):
+    async for event in self:
+      if isinstance(event, StatusEvent):
+        return event
+
+    raise Exception()
+
+  async def get_stable_status(self, *, idle_duration: float = 0.5):
+    status = await self.get_status()
+
+    while True:
+      try:
+        status = await asyncio.wait_for(self.get_status(), timeout=idle_duration)
+      except TimeoutError:
+        return status
+
+
+  # Iterator methods
 
   def __aiter__(self):
     return self
