@@ -1,9 +1,11 @@
-from dataclasses import dataclass
-from typing import Optional, cast
 import asyncio
 import random
 import struct
-import time
+import traceback
+import warnings
+from asyncio import Future, Lock, Task
+from dataclasses import dataclass
+from typing import Optional, cast
 
 import usb.backend
 import usb.core
@@ -90,26 +92,55 @@ class ObjectiveInfo:
 class MicroscopeDevice:
   def __init__(self, device: usb.core.Device):
     self._device = device
-    self._lock = asyncio.Lock()
+    self._lock = Lock()
     self._next_request_number = random.randrange(0xffff)
+    self._requests = dict[int, Future[bytes]]()
+    self._receive_task: Optional[Task] = None
+
+  def __del__(self):
+    if self._receive_task:
+      self._receive_task.cancel()
+
+  async def _receive_loop(self):
+    loop = asyncio.get_event_loop()
+
+    try:
+      while self._requests:
+        response = cast(bytes, (await loop.run_in_executor(None, lambda: self._device.read(0x81, 62, 10000))).tobytes())
+        response_number, = struct.unpack(">H", response[60:])
+
+        future = self._requests.get(response_number)
+
+        if future:
+          future.set_result(response)
+          del self._requests[response_number]
+        else:
+          warnings.warn(f"Leaked request with number '{response_number}'")
+    except asyncio.CancelledError:
+      pass
+    except Exception:
+      traceback.print_exc()
+    finally:
+      self._receive_task = None
 
   async def _request(self, payload: bytes, /):
     request_number = self._next_request_number
     self._next_request_number = (self._next_request_number + 1) % 0xffff
     # print("WRITE", "".join([f"{a:02x}" for a in list(payload.ljust(58, b"\x00") + b"\x30\x31" + struct.pack(">H", request_number))]))
 
-    def run():
-      self._device.write(0x01, payload.ljust(58, b"\x00") + b"\x30\x31" + struct.pack(">H", request_number))
+    future = Future[bytes]()
+    self._requests[request_number] = future
 
-      while True:
-        response = cast(bytes, self._device.read(0x81, 62, 10000).tobytes())
-        response_number, = struct.unpack(">H", response[60:])
+    if not self._receive_task:
+      self._receive_task = asyncio.create_task(self._receive_loop())
 
-        if response_number == request_number:
-          return response
+    self._device.write(0x01, payload.ljust(58, b"\x00") + b"\x30\x31" + struct.pack(">H", request_number))
 
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, run)
+    try:
+      return await asyncio.wait_for(asyncio.shield(future), 15e3)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+      del self._requests[request_number]
+      raise
 
   async def _call(self, call_type: int, payload: bytes, /):
     return await self._request(b"\x01\x00\x21\xff\x00\x00" + bytes([call_type]) + payload.rjust(4, b"\x00"))
